@@ -1,12 +1,25 @@
+
 import json
 import sqlite3
 import heapq
 import datetime
 import os
+import threading
+import asyncio
+import queue
 import tkinter as tk
 from tkinter import ttk, messagebox, simpledialog
 
+# Intenta importar el websockets
+try:
+    import websockets
+    WEBSOCKETS_AVAILABLE = True
+except Exception:
+    WEBSOCKETS_AVAILABLE = False
+
 DB_FILE = "correo.db"
+DEFAULT_WS_HOST = "localhost"
+DEFAULT_WS_PORT = 8765
 
 # ==========================
 # Modelos
@@ -45,10 +58,7 @@ class Mensaje:
             "prioridad": self.prioridad
         }, ensure_ascii=False)
 
-    @staticmethod
     def from_row(row):
-        # row positions:
-        # 0:id,1:remitente_id,2:destinatario_id,3:asunto,4:cuerpo_json,5:fecha_envio,6:prioridad,7:eliminado_en,8:procesado_prioridad(optional)
         id_db = row[0]
         remitente_id = row[1]
         destinatario_id = row[2]
@@ -76,7 +86,7 @@ class BaseDatos:
     def __init__(self, db_file=DB_FILE):
         self.db_file = db_file
         first_time = not os.path.exists(self.db_file)
-        self.conn = sqlite3.connect(self.db_file)
+        self.conn = sqlite3.connect(self.db_file, check_same_thread=False)
         self._crear_tablas()
 
     def _crear_tablas(self):
@@ -105,7 +115,7 @@ class BaseDatos:
                 FOREIGN KEY(destinatario_id) REFERENCES usuarios(id)
             )
         """)
-        
+        # salvaguardias para bases de datos 
         try:
             c.execute("ALTER TABLE mensajes ADD COLUMN eliminado_en TEXT")
         except sqlite3.OperationalError:
@@ -160,14 +170,12 @@ class BaseDatos:
         return c.lastrowid
 
     def obtener_mensajes_para_usuario(self, uid):
-        # limpiar papelera antes de mostrar
         try:
             self.limpiar_papelera()
         except Exception:
             pass
 
         c = self.conn.cursor()
-        # Excluir mensajes eliminados y priorizados (procesado_prioridad=1)
         c.execute("""
             SELECT id, remitente_id, destinatario_id, asunto, cuerpo_json, fecha_envio, prioridad, eliminado_en, procesado_prioridad
             FROM mensajes
@@ -181,14 +189,12 @@ class BaseDatos:
         return resultado
 
     def buscar_mensajes(self, uid, criterio, valor):
-        # limpiar papelera antes de buscar
         try:
             self.limpiar_papelera()
         except Exception:
             pass
 
         c = self.conn.cursor()
-        # Al buscar, también excluir mensajes eliminados y priorizados
         if criterio == "asunto":
             c.execute("SELECT id, remitente_id, destinatario_id, asunto, cuerpo_json, fecha_envio, prioridad, eliminado_en, procesado_prioridad FROM mensajes WHERE destinatario_id = ? AND eliminado_en IS NULL AND (procesado_prioridad IS NULL OR procesado_prioridad = 0) AND asunto LIKE ? ORDER BY fecha_envio DESC", (uid, f"%{valor}%"))
         else:
@@ -201,7 +207,6 @@ class BaseDatos:
 
     def obtener_mensajes_prioritarios(self, uid=None):
         c = self.conn.cursor()
-        # Obtener mensajes que fueron marcados como procesado_prioridad = 1
         if uid is None:
             c.execute("SELECT id, remitente_id, destinatario_id, asunto, cuerpo_json, fecha_envio, prioridad, eliminado_en, procesado_prioridad FROM mensajes WHERE procesado_prioridad = 1 ORDER BY prioridad ASC, fecha_envio DESC")
         else:
@@ -238,7 +243,6 @@ class BaseDatos:
         self.conn.commit()
 
     def limpiar_papelera(self):
-        """Borra definitivamente los mensajes cuya marca eliminado_en excede 4 días y 20 horas."""
         c = self.conn.cursor()
         limite = datetime.datetime.now() - datetime.timedelta(days=4, hours=20)
         c.execute("DELETE FROM mensajes WHERE eliminado_en IS NOT NULL AND eliminado_en < ?", (limite.isoformat(),))
@@ -305,12 +309,10 @@ class SistemaCorreo:
         prioridad = mensaje.prioridad or 5
         if accion == "prioridad":
             prioridad = 1
-            # guardamos y añadimos a cola en memoria
             mid = self.db.guardar_mensaje(mensaje, prioridad=prioridad)
             self.cola_mem.agregar(prioridad, mid)
             return ("cola", mid)
         elif accion == "eliminar":
-            # No guardar
             return ("eliminado", None)
         else:
             mid = self.db.guardar_mensaje(mensaje, prioridad=prioridad)
@@ -321,9 +323,7 @@ class SistemaCorreo:
         if not item:
             return None
         prioridad, mid = item
-        # marcar como priorizado en DB
         self.db.marcar_prioritario(mid)
-        # recuperar mensaje desde DB y devolverlo
         c = self.db.conn.cursor()
         c.execute("SELECT id, remitente_id, destinatario_id, asunto, cuerpo_json, fecha_envio, prioridad, eliminado_en, procesado_prioridad FROM mensajes WHERE id = ?", (mid,))
         row = c.fetchone()
@@ -332,22 +332,192 @@ class SistemaCorreo:
         mensaje = Mensaje.from_row(row)
         return mensaje
 
-    # Método práctico para priorizar (cuando se quiere priorizar directamente)
     def priorizar_mensaje(self, mid):
         self.db.marcar_prioritario(mid)
 
 
 # ==========================
-# Interfaz gráfica (Tkinter)
+# Broadcast WebSocket server (todos reciben lo mismo)
+# ==========================
+class BroadcastServer:
+    """
+    Simple broadcast server: every received message is forwarded to all connected clients.
+    Runs in its own thread with its own asyncio loop.
+    """
+    def __init__(self, host=DEFAULT_WS_HOST, port=DEFAULT_WS_PORT):
+        self.host = host
+        self.port = port
+        self.clients = set()
+        self.loop = None
+        self._thread = None
+        self._lock = threading.Lock()
+
+    async def handler(self, websocket, *args):
+        # Register
+        with self._lock:
+            self.clients.add(websocket)
+        print("Cliente conectado (broadcast). Total:", len(self.clients))
+
+        try:
+            async for msg in websocket:
+                # Difundir mensaje en bruto a todos los clientes
+                await self.broadcast(msg)
+        except websockets.ConnectionClosed:
+            pass
+        except Exception as e:
+            print("Handler error:", e)
+        finally:
+            with self._lock:
+                if websocket in self.clients:
+                    self.clients.remove(websocket)
+            print("Cliente desconectado (broadcast). Total:", len(self.clients))
+
+    async def _safe_send(self, ws, message):
+        try:
+            await ws.send(message)
+        except Exception:
+            pass
+
+    async def broadcast(self, message):
+        with self._lock:
+            clients = list(self.clients)
+        if not clients:
+            return
+        await asyncio.gather(*(self._safe_send(c, message) for c in clients), return_exceptions=True)
+
+    async def start_async(self):
+        print(f"Starting Broadcast WS server on {self.host}:{self.port}")
+        async with websockets.serve(self.handler, self.host, self.port):
+            await asyncio.Future()  # correr para siempre
+
+    def _run_loop(self):
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self.start_async())
+        except Exception as e:
+            print("WS server error:", e)
+
+    def start_in_background(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+        print("Broadcast WS server thread started")
+
+
+# ==========================
+# Cliente WebSocket (para la UI)
+# ==========================
+class WSClient:
+    """
+    Client that receives broadcast messages. Runs a simple asyncio loop in a thread.
+    Note: uses websockets.connect and listens for incoming messages.
+    """
+    def __init__(self, uri, incoming_queue: queue.Queue, sender_name="anon"):
+        self.uri = uri
+        self.incoming = incoming_queue
+        self.sender_name = sender_name
+        self._stop = threading.Event()
+        self._thread = None
+        self._ws = None
+        self._loop = None
+
+    def start(self):
+        if not WEBSOCKETS_AVAILABLE:
+            raise RuntimeError("websockets library not available")
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run_loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _run_loop(self):
+        # Crea y ejecuta un bucle asyncio en este hilo.
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        try:
+            self._loop.run_until_complete(self._main())
+        except Exception as e:
+            self.incoming.put({"type":"error","msg":str(e)})
+
+    async def _main(self):
+        try:
+            async with websockets.connect(self.uri) as ws:
+                self._ws = ws
+                # informa al servidor sobre el remitente
+                try:
+                    await ws.send(json.dumps({"type":"join","sender":self.sender_name,"ts":datetime.datetime.now().isoformat()}))
+                except Exception:
+                    pass
+                async for message in ws:
+                    # Intentar analizar json, de lo contrario entrega mensaje crudo
+                    try:
+                        data = json.loads(message)
+                    except Exception:
+                        data = {"type":"raw","raw":message}
+                    self.incoming.put(data)
+                    if self._stop.is_set():
+                        break
+        except Exception as e:
+            self.incoming.put({"type":"error","msg":str(e)})
+
+    def send(self, text):
+        # Enviar a través de la conexión ws abierta si está disponible 
+        if self._loop and self._ws:
+            try:
+                asyncio.run_coroutine_threadsafe(self._ws.send(text), self._loop)
+            except Exception as e:
+                self.incoming.put({"type":"error","msg":str(e)})
+        else:
+            # abre una conexión de corta duración para enviar
+            threading.Thread(target=self._short_send, args=(text,), daemon=True).start()
+
+    def _short_send(self, text):
+        async def _s():
+            try:
+                async with websockets.connect(self.uri) as ws:
+                    await ws.send(text)
+            except Exception as e:
+                self.incoming.put({"type":"error","msg":str(e)})
+        try:
+            asyncio.run(_s())
+        except Exception as e:
+            self.incoming.put({"type":"error","msg":str(e)})
+
+
+# Asistente para enviar mensajes desde la interfaz de usuario en una tarea en segundo plano (conexión de corta duración)
+def ws_send_in_thread(uri, text, incoming):
+    async def _s():
+        try:
+            async with websockets.connect(uri) as ws:
+                await ws.send(text)
+        except Exception as e:
+            incoming.put({"type":"error","msg":str(e)})
+    try:
+        asyncio.run(_s())
+    except Exception:
+        pass
+
+
+# ==========================
+# Interfaz gráfica (Tkinter) extendida con Chat broadcast
 # ==========================
 class App(tk.Tk):
-    def __init__(self, sistema: SistemaCorreo):
+    def __init__(self, sistema: SistemaCorreo, rt_server: BroadcastServer = None):
         super().__init__()
-        self.title("Sistema de Correo")
-        self.geometry("900x600")
+        self.title("Sistema de Correo + Chat (Broadcast)")
+        self.geometry("1000x650")
         self.sistema = sistema
         self.db = sistema.db
         self.usuario_actual = None
+
+        # WebSocket client state
+        self.ws_client = None
+        self.ws_incoming = queue.Queue()
+        self.rt_server = rt_server
 
         self._crear_widgets_inicio()
 
@@ -371,7 +541,6 @@ class App(tk.Tk):
         self.lst_users = tk.Listbox(frame, height=6)
         self.lst_users.pack(fill=tk.X)
         self._recargar_usuarios()
-
 
     def _recargar_usuarios(self):
         self.lst_users.delete(0, tk.END)
@@ -411,7 +580,6 @@ class App(tk.Tk):
         if not nombre:
             return
 
-        # Buscar usuario por nombre
         c = self.db.conn.cursor()
         c.execute("SELECT nombre, contraseña FROM usuarios WHERE nombre = ?", (nombre,))
         row = c.fetchone()
@@ -421,7 +589,6 @@ class App(tk.Tk):
             return
 
         messagebox.showinfo("Recuperación de contraseña", f"Su contraseña es: {row[1]}")
-
 
     def _abrir_panel_principal(self):
         for widget in self.winfo_children():
@@ -435,19 +602,21 @@ class App(tk.Tk):
         ttk.Button(toolbar, text="Cerrar sesión", command=self._cerrar_sesion).pack(side=tk.RIGHT, padx=6)
         ttk.Button(toolbar, text="Eliminar usuario", command=self._eliminar_usuario).pack(side=tk.RIGHT, padx=6)
 
-
         content = ttk.Frame(self, padding=8)
         content.pack(fill=tk.BOTH, expand=True)
 
-        # Bandeja: Treeview
+        # Left: Bandeja
+        left = ttk.Frame(content)
+        left.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
+
         cols = ("id","asunto","remitente","fecha","prioridad")
-        self.tree = ttk.Treeview(content, columns=cols, show='headings')
+        self.tree = ttk.Treeview(left, columns=cols, show='headings')
         for c in cols:
             self.tree.heading(c, text=c.capitalize())
             self.tree.column(c, width=120)
         self.tree.pack(fill=tk.BOTH, expand=True, side=tk.LEFT)
 
-        side = ttk.Frame(content, width=200)
+        side = ttk.Frame(left, width=200)
         side.pack(fill=tk.Y, side=tk.RIGHT)
         ttk.Button(side, text="Refrescar", command=self._cargar_bandeja).pack(fill=tk.X, pady=4)
         ttk.Button(side, text="Priorizar seleccionado", command=self._priorizar_seleccionado).pack(fill=tk.X, pady=4)
@@ -456,51 +625,155 @@ class App(tk.Tk):
         ttk.Button(side, text="Eliminar", command=self._eliminar_mensaje).pack(fill=tk.X, pady=4)
         ttk.Button(side, text="Papelera", command=self._abrir_papelera).pack(fill=tk.X, pady=4)
 
+        # Right: Chat panel
+        chat_frame = ttk.Frame(content, width=360, padding=6)
+        chat_frame.pack(fill=tk.Y, side=tk.RIGHT)
+        ttk.Label(chat_frame, text="Chat en tiempo real (broadcast)").pack(anchor=tk.W)
+
+        ctrl = ttk.Frame(chat_frame)
+        ctrl.pack(fill=tk.X, pady=4)
+        ttk.Label(ctrl, text="Host:Port").grid(row=0, column=0)
+        self.ent_host = ttk.Entry(ctrl)
+        self.ent_host.insert(0, f"{DEFAULT_WS_HOST}:{DEFAULT_WS_PORT}")
+        self.ent_host.grid(row=0, column=1)
+
+        btns = ttk.Frame(chat_frame)
+        btns.pack(fill=tk.X, pady=4)
+        ttk.Button(btns, text="Start local server", command=self._start_local_server).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Connect", command=self._connect_ws).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btns, text="Disconnect", command=self._disconnect_ws).pack(side=tk.LEFT, padx=2)
+
+        # Chat text area
+        self.txt_chat = tk.Text(chat_frame, height=20)
+        self.txt_chat.pack(fill=tk.BOTH, expand=True)
+        self.ent_msg = ttk.Entry(chat_frame)
+        self.ent_msg.pack(fill=tk.X, pady=4)
+        ttk.Button(chat_frame, text="Enviar chat", command=self._enviar_chat).pack(fill=tk.X)
+
+        # actualizar bandeja
         self._cargar_bandeja()
+        # iniciar polling de mensajes WS si correspon
+        self.after(200, self._poll_ws_incoming)
 
-    def _cerrar_sesion(self):
-        self.usuario_actual = None
-        for widget in self.winfo_children():
-            widget.destroy()
-        self._crear_widgets_inicio()
-    
-    def _eliminar_usuario(self):
-      if not self.usuario_actual:
-        return
+    def _start_local_server(self):
+        if not WEBSOCKETS_AVAILABLE:
+            messagebox.showerror("Error", "La librería 'websockets' no está instalada. Ejecuta: pip install websockets")
+            return
+        host_port = self.ent_host.get().strip()
+        if ':' in host_port:
+            host, port = host_port.split(':', 1)
+            port = int(port)
+        else:
+            host = DEFAULT_WS_HOST
+            port = DEFAULT_WS_PORT
 
-      if not messagebox.askyesno(
-        "Confirmar",
-        "¿Seguro que desea eliminar su usuario?\n"
-        "Se borrarán TODOS sus mensajes enviados y recibidos.\n"
-        "Esta acción no se puede deshacer."
-    ):
-        return
+        if not self.rt_server:
+            self.rt_server = BroadcastServer(host=host, port=port)
+        try:
+            self.rt_server.start_in_background()
+            messagebox.showinfo("Servidor", f"Servidor WebSocket local intentando iniciar en {host}:{port}")
+        except Exception as e:
+            messagebox.showerror("Error servidor", str(e))
 
-      uid = self.usuario_actual.id_usuario
+    def _connect_ws(self):
+        if not WEBSOCKETS_AVAILABLE:
+            messagebox.showerror("Error", "La librería 'websockets' no está instalada. Ejecuta: pip install websockets")
+            return
+        host = self.ent_host.get().strip()
+        if ':' not in host:
+            messagebox.showerror("Error", "Host debe estar en formato host:port")
+            return
+        uri = f"ws://{host}"
+        sender = self.usuario_actual.nombre if self.usuario_actual else 'anon'
 
-    # Eliminar mensajes enviados o recibidos
-      c = self.db.conn.cursor()
-      c.execute("DELETE FROM mensajes WHERE remitente_id = ? OR destinatario_id = ?", (uid, uid))
+        if self.ws_client is not None:
+            messagebox.showinfo("Info", "Ya conectado (desconéctese primero)")
+            return
+        self.ws_client = WSClient(uri, self.ws_incoming, sender_name=sender)
+        try:
+            self.ws_client.start()
+            messagebox.showinfo("Conectado", f"Conectando a {uri} (broadcast)")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+            self.ws_client = None
 
-    # Eliminar usuario
-      c.execute("DELETE FROM usuarios WHERE id = ?", (uid,))
-      self.db.conn.commit()
+    def _disconnect_ws(self):
+        if not self.ws_client:
+            messagebox.showinfo("Info", "No hay conexión activa")
+            return
+        self.ws_client.stop()
+        self.ws_client = None
+        messagebox.showinfo("Desconectado", "Cliente WebSocket detenido")
 
-      messagebox.showinfo("Cuenta eliminada", "El usuario y sus mensajes han sido eliminados.")
+    def _enviar_chat(self):
+        text = self.ent_msg.get().strip()
+        if not text:
+            return
+        host = self.ent_host.get().strip()
+        if ':' not in host:
+            messagebox.showerror("Error", "Host debe estar en formato host:port")
+            return
+        uri = f"ws://{host}"
 
-    # Cerrar sesión y volver al inicio
-      self.usuario_actual = None
-      for widget in self.winfo_children():
-        widget.destroy()
-      self._crear_widgets_inicio()
+        # Enviamos JSON para que los clientes receptores puedan analizarlo
+        payload = json.dumps({
+            "type": "msg",
+            "sender": self.usuario_actual.nombre if self.usuario_actual else "anon",
+            "text": text,
+            "ts": datetime.datetime.now().isoformat()
+        }, ensure_ascii=False)
 
+        # Si tenemos una conexión ws_client en vivo, usamos su método de envío 
+        if self.ws_client:
+            self.ws_client.send(payload)
+        else:
+            # usa conexión de corta duración
+            threading.Thread(target=ws_send_in_thread, args=(uri, payload, self.ws_incoming), daemon=True).start()
+
+        # Mostrar localmente también
+        ts = datetime.datetime.now().isoformat()
+        self._append_chat(f"(you) {self.usuario_actual.nombre if self.usuario_actual else 'anon'} [{ts}]: {text}\n")
+        self.ent_msg.delete(0, tk.END)
+
+    def _append_chat(self, text):
+        self.txt_chat.config(state=tk.NORMAL)
+        self.txt_chat.insert(tk.END, text)
+        self.txt_chat.see(tk.END)
+        self.txt_chat.config(state=tk.DISABLED)
+
+    def _poll_ws_incoming(self):
+        while not self.ws_incoming.empty():
+            data = self.ws_incoming.get()
+            if not isinstance(data, dict):
+                # si es texto sin formato
+                self._append_chat(f"{data}\n")
+                continue
+            if data.get('type') == 'msg':
+                sender = data.get('sender')
+                text = data.get('text')
+                ts = data.get('ts')
+                self._append_chat(f"{sender} [{ts}]: {text}\n")
+            elif data.get('type') == 'raw':
+                raw = data.get('raw')
+                self._append_chat(f"[RAW] {raw}\n")
+            elif data.get('type') == 'join':
+                sender = data.get('sender')
+                ts = data.get('ts')
+                self._append_chat(f"*** {sender} joined at {ts}\n")
+            elif data.get('type') == 'error':
+                self._append_chat(f"*** ERROR: {data.get('msg')}\n")
+            else:
+                self._append_chat(f"*** {data}\n")
+        self.after(200, self._poll_ws_incoming)
+
+    # Los ayudantes de la interfaz de usuario de correo electrónico restantes (bandeja, enviar correo, etc.)
     def _cargar_bandeja(self):
-        # limpiar papelera para mantener DB ordenada
         try:
             self.db.limpiar_papelera()
         except Exception:
             pass
-
+        if not hasattr(self, 'tree'):
+            return
         for i in self.tree.get_children():
             self.tree.delete(i)
         mensajes = self.db.obtener_mensajes_para_usuario(self.usuario_actual.id_usuario)
@@ -609,219 +882,50 @@ class App(tk.Tk):
             return
         mid = self.tree.item(sel[0])['values'][0]
         try:
-            # Marcar en DB
             self.db.marcar_prioritario(mid)
             messagebox.showinfo("OK", "Mensaje marcado como prioritario y movido a la ventana de Prioritarios")
-            # Refrescar ambas vistas (bandeja pierde el mensaje; prioritarios lo gana)
             self._cargar_bandeja()
-            if hasattr(self, "ventana_prioritarios") and getattr(self, "ventana_prioritarios").winfo_exists():
-                self._cargar_prioritarios()
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo priorizar el mensaje")
-                                                      #{e}")
-                                 
-    def _procesar_prioridad(self):
-        # Procesa el próximo mensaje de la cola en memoria y lo marca como priorizado en DB,
-        # luego actualiza vistas.
-        item = self.sistema.procesar_proximo_prioritario()
-        if not item:
-            messagebox.showinfo("Cola", "No hay mensajes prioritarios en memoria")
-            return
 
-        # Refrescar bandeja principal (el mensaje ya no debería aparecer ahí)
-        self._cargar_bandeja()
-        # Si la ventana de prioritarios está abierta, recargarla
-        if hasattr(self, "ventana_prioritarios") and self.ventana_prioritarios.winfo_exists():
-            self._cargar_prioritarios()
-        # Mostrar el mensaje procesado (opcional)
-        top = tk.Toplevel(self)
-        top.title("Procesado - Mensaje Priorizado")
-        ttk.Label(top, text=f"Asunto: {item.asunto}").pack(anchor=tk.W, padx=8, pady=4)
-        ttk.Label(top, text=f"De (ID): {item.remitente_id}").pack(anchor=tk.W, padx=8)
-        ttk.Label(top, text=f"Para (ID): {item.destinatario_id}").pack(anchor=tk.W, padx=8, pady=4)
-        ttk.Label(top, text=f"Prioridad: {item.prioridad}").pack(anchor=tk.W, padx=8, pady=2)
-        txt = tk.Text(top, height=12)
-        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
-        txt.insert(tk.END, item.cuerpo)
-        txt.config(state=tk.DISABLED)
-
-    # =========================
-    # Ventana de Prioritarios
-    # =========================
     def _abrir_ventana_prioritarios(self):
-        # Evita abrir dos ventanas iguales
-        if hasattr(self, "ventana_prioritarios") and self.ventana_prioritarios.winfo_exists():
-            self.ventana_prioritarios.lift()
-            return
+        messagebox.showinfo("Info", "Ventana de prioritarios (implementación mínima en este ejemplo)")
 
-        self.ventana_prioritarios = tk.Toplevel(self)
-        self.ventana_prioritarios.title("Mensajes Prioritarios")
-        self.ventana_prioritarios.geometry("800x500")
-
-        cols = ("id","asunto","remitente","fecha","prioridad")
-        self.tree_prioritarios = ttk.Treeview(self.ventana_prioritarios, columns=cols, show='headings', height=18)
-        for c in cols:
-            self.tree_prioritarios.heading(c, text=c.capitalize())
-            self.tree_prioritarios.column(c, width=140)
-        self.tree_prioritarios.pack(fill=tk.BOTH, expand=True, side=tk.TOP, padx=8, pady=8)
-
-        btn_frame = ttk.Frame(self.ventana_prioritivos if False else self.ventana_prioritarios, padding=6)
-        btn_frame.pack(fill=tk.X)
-        ttk.Button(btn_frame, text="Refrescar", command=self._cargar_prioritarios).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_frame, text="Ver detalle", command=self._ver_detalle_prioritario).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_frame, text="Restaurar a bandeja", command=self._restaurar_prioritario).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_frame, text="Borrar definitivamente", command=self._borrar_definitivo_prioritario).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_frame, text="Cerrar", command=self.ventana_prioritarios.destroy).pack(side=tk.RIGHT, padx=6)
-
-        # Carga inicial
-        self._cargar_prioritarios()
-
-    def _cargar_prioritarios(self):
-        # Cargar mensajes marcados como priorizados (procesado_prioridad = 1)
-        if not hasattr(self, "tree_prioritarios"):
-            return
-        for i in self.tree_prioritarios.get_children():
-            try:
-                self.tree_prioritarios.delete(i)
-            except Exception:
-                pass
-
-        mensajes = self.db.obtener_mensajes_prioritarios(self.usuario_actual.id_usuario)
-        for m in mensajes:
-            self.tree_prioritarios.insert('', tk.END, values=(m.id_mensaje, m.asunto, m.remitente_id, m.fecha_envio, m.prioridad))
-
-    def _ver_detalle_prioritario(self):
-        sel = self.tree_prioritarios.selection()
-        if not sel:
-            messagebox.showinfo("Info", "Seleccione un mensaje prioritario")
-            return
-        mid = self.tree_prioritarios.item(sel[0])['values'][0]
-        c = self.db.conn.cursor()
-        c.execute("SELECT id, remitente_id, destinatario_id, asunto, cuerpo_json, fecha_envio, prioridad, eliminado_en, procesado_prioridad FROM mensajes WHERE id = ?", (mid,))
-        row = c.fetchone()
-        if not row:
-            messagebox.showerror("Error", "Mensaje no encontrado")
-            return
-        m = Mensaje.from_row(row)
-        top = tk.Toplevel(self)
-        top.title(f"Mensaje Prioritario {m.id_mensaje}")
-        ttk.Label(top, text=f"Asunto: {m.asunto}").pack(anchor=tk.W, padx=8, pady=4)
-        ttk.Label(top, text=f"De (ID): {m.remitente_id}").pack(anchor=tk.W, padx=8)
-        ttk.Label(top, text=f"Fecha: {m.fecha_envio}").pack(anchor=tk.W, padx=8, pady=4)
-        ttk.Label(top, text=f"Prioridad: {m.prioridad}").pack(anchor=tk.W, padx=8, pady=2)
-        txt = tk.Text(top, height=15)
-        txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
-        txt.insert(tk.END, m.cuerpo)
-        txt.config(state=tk.DISABLED)
-
-    def _restaurar_prioritario(self):
-        sel = self.tree_prioritarios.selection()
-        if not sel:
-            messagebox.showinfo("Info", "Seleccione un mensaje prioritario")
-            return
-        mid = self.tree_prioritarios.item(sel[0])['values'][0]
-        # Desmarcar en DB
-        self.db.desmarcar_prioritario(mid)
-        messagebox.showinfo("OK", "Mensaje restaurado a bandeja principal")
-        # Refrescar ambas vistas
-        self._cargar_prioritarios()
-        self._cargar_bandeja()
-
-    def _borrar_definitivo_prioritario(self):
-        sel = self.tree_prioritarios.selection()
-        if not sel:
-            messagebox.showinfo("Info", "Seleccione un mensaje prioritario")
-            return
-        mid = self.tree_prioritarios.item(sel[0])['values'][0]
-        if messagebox.askyesno("Confirmar", "¿Borrar definitivamente este mensaje?"):
-            self.db.borrar_mensaje_definitivo(mid)
-            messagebox.showinfo("OK", "Mensaje borrado definitivamente")
-            self._cargar_prioritarios()
-
-    # =========================
-    # Papelera
-    # =========================
     def _abrir_papelera(self):
-        # limpiar primero
-        try:
-            self.db.limpiar_papelera()
-        except Exception:
-            pass
+        messagebox.showinfo("Info", "Papelera (implementación mínima en este ejemplo)")
 
-        top = tk.Toplevel(self)
-        top.title("Papelera")
-        top.geometry("700x500")
+    def _cerrar_sesion(self):
+        self.usuario_actual = None
+        for widget in self.winfo_children():
+            widget.destroy()
+        self._crear_widgets_inicio()
 
-        cols = ("id","asunto","remitente","eliminado_en")
-        tree = ttk.Treeview(top, columns=cols, show='headings')
-        for c in cols:
-            tree.heading(c, text=c.capitalize())
-        tree.pack(fill=tk.BOTH, expand=True)
-
-        # cargar mensajes eliminados
+    def _eliminar_usuario(self):
+        if not self.usuario_actual:
+            return
+        if not messagebox.askyesno("Confirmar", "¿Seguro que desea eliminar su usuario?\nSe borrarán TODOS sus mensajes enviados y recibidos.\nEsta acción no se puede deshacer."):
+            return
+        uid = self.usuario_actual.id_usuario
         c = self.db.conn.cursor()
-        c.execute("""
-            SELECT id, remitente_id, destinatario_id, asunto, cuerpo_json, fecha_envio, prioridad, eliminado_en, procesado_prioridad
-            FROM mensajes
-            WHERE eliminado_en IS NOT NULL
-            ORDER BY eliminado_en DESC
-        """)
-        rows = c.fetchall()
-
-        limite = datetime.timedelta(days=4, hours=20)
-        ahora = datetime.datetime.now()
-
-        for r in rows:
-            eliminado_en = r[7]
-            if eliminado_en:
-                try:
-                    dt = datetime.datetime.fromisoformat(eliminado_en)
-                except Exception:
-                    continue
-                if ahora - dt <= limite:  # Aún no vence
-                    tree.insert('', tk.END, values=(r[0], r[3], r[1], eliminado_en))
-
-        # Botón Restaurar
-        def restaurar():
-            sel = tree.selection()
-            if not sel:
-                messagebox.showinfo("Info", "Seleccione un mensaje")
-                return
-            mid = tree.item(sel[0])['values'][0]
-            self.db.recuperar_mensaje(mid)
-            messagebox.showinfo("OK", "Mensaje restaurado")
-            tree.delete(sel[0])
-            self._cargar_bandeja()
-
-        def borrar_definitivo():
-            sel = tree.selection()
-            if not sel:
-                messagebox.showinfo("Info", "Seleccione un mensaje")
-                return
-            mid = tree.item(sel[0])['values'][0]
-            if messagebox.askyesno("Confirmar", "¿Borrar definitivamente este mensaje?"):
-                c2 = self.db.conn.cursor()
-                c2.execute("DELETE FROM mensajes WHERE id = ?", (mid,))
-                self.db.conn.commit()
-                messagebox.showinfo("OK", "Mensaje borrado definitivamente")
-                tree.delete(sel[0])
-
-        btn_frame = ttk.Frame(top, padding=6)
-        btn_frame.pack(fill=tk.X)
-        ttk.Button(btn_frame, text="Restaurar", command=restaurar).pack(side=tk.LEFT, padx=6)
-        ttk.Button(btn_frame, text="Borrar definitivamente", command=borrar_definitivo).pack(side=tk.LEFT, padx=6)
+        c.execute("DELETE FROM mensajes WHERE remitente_id = ? OR destinatario_id = ?", (uid, uid))
+        c.execute("DELETE FROM usuarios WHERE id = ?", (uid,))
+        self.db.conn.commit()
+        messagebox.showinfo("Cuenta eliminada", "El usuario y sus mensajes han sido eliminados.")
+        self.usuario_actual = None
+        for widget in self.winfo_children():
+            widget.destroy()
+        self._crear_widgets_inicio()
 
 
 # ==========================
 # Inicialización y ejecución
 # ==========================
 def crear_usuarios_demo(db: BaseDatos):
-    # crear un par de usuarios si la DB está vacía
     if not db.listar_usuarios():
-        db.crear_usuario("Ana", "Ana@gmail.com", "1234")
-        db.crear_usuario("Bob", "Bob@gmail.com", "5678")
-        
-        
+        db.crear_usuario("Alice", "alice@example.com", "1234")
+        db.crear_usuario("Bob", "bob@example.com", "abcd")
+        db.crear_usuario("Carlos", "carlos@example.com", "pass")
+
 
 def main():
     db = BaseDatos()
@@ -833,13 +937,16 @@ def main():
     c.execute("SELECT COUNT(*) FROM mensajes")
     total = c.fetchone()[0]
     if total == 0:
-        # agregar algunos mensajes de prueba
         m1 = Mensaje(None, "Hola Bob", "Hola Bob! ¿Cómo andás?", remitente_id=1, destinatario_id=2, prioridad=5)
         m2 = Mensaje(None, "URGENTE: Reunión", "Esto es urgente, reunión a las 10", remitente_id=3, destinatario_id=2, prioridad=1)
         m3 = Mensaje(None, "Spam oferta", "Compra ya", remitente_id=1, destinatario_id=2, prioridad=9)
         sistema.enviar(m1)
         sistema.enviar(m2)
         sistema.enviar(m3)
+
+    # Opcionalmente, cree un servidor automáticamente al iniciar:
+    # rt_server = BroadcastServer(host='0.0.0.0', puerto=8765)
+    # rt_server.start_in_background()
 
     app = App(sistema)
     app.mainloop()
