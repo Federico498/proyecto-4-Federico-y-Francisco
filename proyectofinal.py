@@ -1,4 +1,3 @@
-
 import json
 import sqlite3
 import heapq
@@ -247,6 +246,29 @@ class BaseDatos:
         limite = datetime.datetime.now() - datetime.timedelta(days=4, hours=20)
         c.execute("DELETE FROM mensajes WHERE eliminado_en IS NOT NULL AND eliminado_en < ?", (limite.isoformat(),))
         self.conn.commit()
+
+    def obtener_mensajes_papelera(self, uid):
+        """
+        Devuelve la lista de Mensaje que están en la papelera para el usuario dado.
+        La columna en la tabla es `eliminado_en` (timestamp) — si NO es NULL, está en papelera.
+        Considera tanto mensajes enviados como recibidos por el usuario.
+        """
+        c = self.conn.cursor()
+        c.execute("""
+            SELECT id, remitente_id, destinatario_id, asunto, cuerpo_json, fecha_envio, prioridad, eliminado_en, procesado_prioridad
+            FROM mensajes
+            WHERE (remitente_id = ? OR destinatario_id = ?) AND eliminado_en IS NOT NULL
+            ORDER BY fecha_envio DESC
+        """, (uid, uid))
+        rows = c.fetchall()
+        resultado = []
+        for r in rows:
+            resultado.append(Mensaje.from_row(r))
+        return resultado
+
+
+
+
 
 
 # ==========================
@@ -888,12 +910,6 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo priorizar el mensaje")
 
-    def _abrir_ventana_prioritarios(self):
-        messagebox.showinfo("Info", "Ventana de prioritarios (implementación mínima en este ejemplo)")
-
-    def _abrir_papelera(self):
-        messagebox.showinfo("Info", "Papelera (implementación mínima en este ejemplo)")
-
     def _cerrar_sesion(self):
         self.usuario_actual = None
         for widget in self.winfo_children():
@@ -915,7 +931,147 @@ class App(tk.Tk):
         for widget in self.winfo_children():
             widget.destroy()
         self._crear_widgets_inicio()
+    
+    def _abrir_ventana_prioritarios(self):
+        win = tk.Toplevel(self)
+        win.title("Mensajes Prioritarios")
+        win.geometry("700x400")
 
+        cols = ("id","asunto","remitente","destinatario","fecha","prioridad")
+        tree = ttk.Treeview(win, columns=cols, show='headings')
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        for c in cols:
+            tree.heading(c, text=c.capitalize())
+            tree.column(c, width=120)
+
+        # obtener mensajes prioritarios desde la DB
+        mensajes = self.db.obtener_mensajes_prioritarios(self.usuario_actual.id_usuario)
+
+        for m in mensajes:
+            remit = self.db.obtener_usuario_por_id(m.remitente_id)
+            dest = self.db.obtener_usuario_por_id(m.destinatario_id)
+            tree.insert("", tk.END, values=(
+                m.id_mensaje,
+                m.asunto,
+                remit.nombre if remit else m.remitente_id,
+                dest.nombre if dest else m.destinatario_id,
+                m.fecha_envio,
+                m.prioridad
+            ))
+
+        ttk.Button(win, text="Cerrar", command=win.destroy).pack(pady=8)
+
+    def _abrir_papelera(self):
+        win = tk.Toplevel(self)
+        win.title("Papelera")
+        win.geometry("800x450")
+
+        cols = ("id","asunto","remitente","destinatario","fecha","prioridad")
+        tree = ttk.Treeview(win, columns=cols, show='headings')
+        tree.pack(fill=tk.BOTH, expand=True, side=tk.TOP, padx=6, pady=6)
+
+        for c in cols:
+            tree.heading(c, text=c.capitalize())
+            tree.column(c, width=130)
+
+        # Frame de botones abajo
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=6, pady=6)
+
+        def cargar_lista():
+            for i in tree.get_children():
+                tree.delete(i)
+            mensajes = self.db.obtener_mensajes_papelera(self.usuario_actual.id_usuario)
+            for m in mensajes:
+                remit = self.db.obtener_usuario_por_id(m.remitente_id)
+                dest = self.db.obtener_usuario_por_id(m.destinatario_id)
+                tree.insert("", tk.END, iid=str(m.id_mensaje), values=(
+                    m.id_mensaje,
+                    m.asunto or "",
+                    remit.nombre if remit else m.remitente_id,
+                    dest.nombre if dest else m.destinatario_id,
+                    m.fecha_envio,
+                    m.prioridad
+                ))
+
+        def ver_detalle_papelera():
+            sel = tree.selection()
+            if not sel:
+                messagebox.showinfo("Info", "Seleccione un mensaje")
+                return
+            mid = int(sel[0])
+            c = self.db.conn.cursor()
+            c.execute("SELECT id, remitente_id, destinatario_id, asunto, cuerpo_json, fecha_envio, prioridad, eliminado_en, procesado_prioridad FROM mensajes WHERE id = ?", (mid,))
+            row = c.fetchone()
+            if not row:
+                messagebox.showerror("Error", "Mensaje no encontrado")
+                return
+            m = Mensaje.from_row(row)
+            top = tk.Toplevel(win)
+            top.title(f"Mensaje {m.id_mensaje}")
+            top.geometry("600x400")
+            ttk.Label(top, text=f"Asunto: {m.asunto}").pack(anchor=tk.W, padx=8, pady=4)
+            ttk.Label(top, text=f"De (ID): {m.remitente_id}").pack(anchor=tk.W, padx=8)
+            ttk.Label(top, text=f"Para (ID): {m.destinatario_id}").pack(anchor=tk.W, padx=8)
+            ttk.Label(top, text=f"Fecha: {m.fecha_envio}").pack(anchor=tk.W, padx=8, pady=4)
+            ttk.Label(top, text=f"Prioridad: {m.prioridad}").pack(anchor=tk.W, padx=8, pady=2)
+            txt = tk.Text(top, height=15)
+            txt.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+            txt.insert(tk.END, m.cuerpo)
+            txt.config(state=tk.DISABLED)
+
+        def restaurar_seleccionados():
+            sels = tree.selection()
+            if not sels:
+                messagebox.showinfo("Info", "Seleccione al menos un mensaje para restaurar.")
+                return
+            if not messagebox.askyesno("Confirmar", f"Restaurar {len(sels)} mensaje(s) a la bandeja de entrada?"):
+                return
+            for s in sels:
+                mid = int(s)
+                try:
+                    self.db.recuperar_mensaje(mid)   # esto pone eliminado_en = NULL
+                except Exception as e:
+                    messagebox.showerror("Error", f"No se pudo restaurar id={mid}: {e}")
+            messagebox.showinfo("Restaurado", "Mensaje(s) restaurado(s).")
+            cargar_lista()
+            # refrescar bandeja principal
+            try:
+                self._cargar_bandeja()
+            except Exception:
+                pass
+
+        def borrar_definitivo():
+            sels = tree.selection()
+            if not sels:
+                messagebox.showinfo("Info", "Seleccione al menos un mensaje para borrar definitivamente.")
+                return
+            if not messagebox.askyesno("Confirmar", f"Borrar DEFINITIVAMENTE {len(sels)} mensaje(s)? Esta acción no se puede deshacer."):
+                return
+            for s in sels:
+                mid = int(s)
+                try:
+                    self.db.borrar_mensaje_definitivo(mid)
+                except Exception as e:
+                    messagebox.showerror("Error", f"No se pudo borrar id={mid}: {e}")
+            messagebox.showinfo("Borrado", "Mensaje(s) eliminados permanentemente.")
+            cargar_lista()
+            try:
+                self._cargar_bandeja()
+            except Exception:
+                pass
+
+        ttk.Button(btn_frame, text="Restaurar seleccionado", command=restaurar_seleccionados).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Borrar definitivamente", command=borrar_definitivo).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Ver detalle", command=ver_detalle_papelera).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Refrescar", command=cargar_lista).pack(side=tk.LEFT, padx=4)
+        ttk.Button(btn_frame, text="Cerrar", command=win.destroy).pack(side=tk.RIGHT, padx=4)
+
+        # carga inicial
+        cargar_lista()
+
+    
 
 # ==========================
 # Inicialización y ejecución
@@ -954,3 +1110,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
